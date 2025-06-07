@@ -1,0 +1,494 @@
+name: Build SukiSU Ultra SCX
+
+on:
+  workflow_dispatch:
+    inputs:
+      CPU:
+        description: "分支（SoC平台）"
+        type: choice
+        required: true
+        default: sm8550
+        options:
+          - sm7550
+          - sm7675
+          - sm8450
+          - sm8475
+          - sm8550
+          - sm8650
+          - sm8750
+      FEIL:
+        description: "配置文件"
+        type: choice
+        required: true
+        default: oneplus_ace3_v
+        options:
+          - oneplus_nord_ce4_v
+          - oneplus_ace_3v_v
+          - oneplus_nord_4_v
+          - oneplus_10_pro_v
+          - oneplus_10t_v
+          - oneplus_11r_v
+          - oneplus_ace2_v
+          - oneplus_ace_pro_v
+          - oneplus_11_v
+          - oneplus_12r_v
+          - oneplus_ace2pro_v
+          - oneplus_ace3_v
+          - oneplus_open_v
+          - oneplus12_v
+          - oneplus_13r
+          - oneplus_ace3_pro_v
+          - oneplus_ace5
+          - oneplus_pad2_v
+          - oneplus_13
+          - oneplus_ace5_pro
+          - oneplus_13t
+          - GitHub有bug可能不显示最后一项,误使用此项
+      CPUD:
+        description: "处理器代号"
+        type: choice
+        required: true
+        default: kalama
+        options:
+          - crow
+          - waipio
+          - kalama
+          - pineapple
+          - sun
+      ANDROID_VERSION:
+        description: "内核安卓版本"
+        type: choice
+        required: true
+        default: android13
+        options:
+          - android12
+          - android13
+          - android14
+          - android15
+      KERNEL_VERSION:
+        description: "内核版本"
+        type: choice
+        required: true
+        default: "5.15"
+        options:
+          - "5.10"
+          - "5.15"
+          - "6.1"
+          - "6.6"
+      ZRAM:
+        description: "是否启用更多ZRAM算法（推荐开启）"
+        type: boolean
+        required: true
+        default: true
+      SCX:
+        description: "是否启用SCX调速器"
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 8G
+
+    steps:
+      - name: 最大化构建空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt update
+          sudo apt install -y python3 git curl ccache unzip libelf-dev lld llvm clang llvm-dev
+
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 下载manifest并生成ccache哈希
+        id: manifest_hash
+        run: |
+          mkdir -p kernel_workspace
+          curl -LSs "https://raw.githubusercontent.com/OnePlusOSS/kernel_manifest/refs/heads/oneplus/${{ github.event.inputs.CPU }}/${{ github.event.inputs.FEIL }}.xml" \
+            -o kernel_workspace/${{ github.event.inputs.FEIL }}.xml
+          echo "hash=$(sha256sum kernel_workspace/${{ github.event.inputs.FEIL }}.xml | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: 恢复ccache缓存
+        uses: actions/cache@v3
+        with:
+          path: /home/runner/.ccache
+          key: ccache-${{ runner.os }}-${{ github.event.inputs.CPU }}-${{ github.event.inputs.FEIL }}-${{ github.event.inputs.KERNEL_VERSION }}-${{ steps.manifest_hash.outputs.hash }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.event.inputs.CPU }}-
+
+      - name: 配置Git信息
+        run: |
+          git config --global user.name "FurLC"
+          git config --global user.email "qq441791056@163.com"
+
+      - name: 安装repo工具
+        run: |
+          curl --retry 3 https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: 初始化repo并同步源码
+        run: |
+          set -e
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b refs/heads/oneplus/${{ github.event.inputs.CPU }} \
+            -m ${{ github.event.inputs.FEIL }}.xml --depth=1
+          repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
+          # 清理abi导出和-dirty标记
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || true
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || true
+          for script in \
+            kernel_platform/common/scripts/setlocalversion \
+            kernel_platform/msm-kernel/scripts/setlocalversion \
+            kernel_platform/external/dtc/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' $script
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' $script
+            sed -i '$s|echo "\$res"|echo "-FurLC"|' $script
+          done
+
+      - name: 注入KernelSU-SukiSU Ultra
+        run: |
+          cd kernel_workspace/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+          cd KernelSU
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+
+      - name: 设置susfs并应用主补丁
+        run: |
+          set -e
+          cd kernel_workspace
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}
+          git clone --depth=1 https://github.com/SukiSU-Ultra/SukiSU_patch.git
+          wget https://raw.githubusercontent.com/FurLC/Action_OnePlus_KernelSU_SUSFS/main/ogki2gki.patch
+          wget https://raw.githubusercontent.com/FurLC/Action_OnePlus_KernelSU_SUSFS/main/ogki2gki_c99fix.patch
+
+          cd kernel_platform
+          PATCHDIR="../susfs4ksu/kernel_patches"
+          SUKIPATCH="../SukiSU_patch"
+          COMMON="./common"
+
+          cp $PATCHDIR/50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch $COMMON/ 2>/dev/null || true
+          mkdir -p $COMMON/fs $COMMON/include/linux $COMMON/lib $COMMON/crypto
+          cp $PATCHDIR/fs/* $COMMON/fs/ 2>/dev/null || true
+          cp $PATCHDIR/include/linux/* $COMMON/include/linux/ 2>/dev/null || true
+          if [[ "${{ github.event.inputs.ZRAM }}" == "true" ]]; then
+            cp -r $SUKIPATCH/other/zram/lz4k/include/linux/* $COMMON/include/linux/ 2>/dev/null || true
+            cp -r $SUKIPATCH/other/zram/lz4k/lib/* $COMMON/lib/ 2>/dev/null || true
+            cp -r $SUKIPATCH/other/zram/lz4k/crypto/* $COMMON/crypto/ 2>/dev/null || true
+            cp -r $SUKIPATCH/other/zram/lz4k_oplus $COMMON/lib/ 2>/dev/null || true
+          fi
+          cp ../ogki2gki.patch $COMMON/
+          cp ../ogki2gki_c99fix.patch $COMMON/
+
+          cd $COMMON
+          SUSFS_PATCH="50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch"
+          if [[ -f "$SUSFS_PATCH" ]]; then
+            sed -i 's/-32,12 +32,38/-32,11 +32,37/g' "$SUSFS_PATCH"
+            sed -i '/#include <trace\/hooks\/fs.h>/d' "$SUSFS_PATCH"
+            patch -p1 < "$SUSFS_PATCH" || true
+          fi
+
+          cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
+          patch -p1 -F 3 < syscall_hooks.patch || true
+          patch -p1 -F 3 < ogki2gki_c99fix.patch
+          echo "✅ SUSFS 和 syscall_hooks patch 应用完成"
+
+      - name: 应用zram相关补丁
+        if: ${{ github.event.inputs.ZRAM == 'true' }}
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform/common
+
+          PATCH_LIST=(
+            "lz4kd"
+            "lz4k_oplus"
+          )
+          PATCH_BASE=../../SukiSU_patch/other/zram/zram_patch/${{ github.event.inputs.KERNEL_VERSION }}
+
+          for PATCH_NAME in "${PATCH_LIST[@]}"; do
+            PATCH_FILE="$PATCH_BASE/$PATCH_NAME.patch"
+            LOCAL_PATCH="./$PATCH_NAME.patch"
+            if [[ -f "$PATCH_FILE" ]]; then
+              echo "🟢 应用补丁: $PATCH_NAME"
+              cp "$PATCH_FILE" "$LOCAL_PATCH"
+              patch -p1 -F 3 < "$LOCAL_PATCH" || echo "⚠️ $PATCH_NAME patch失败(已应用/冲突可忽略)"
+            else
+              echo "❗ 未找到$PATCH_NAME补丁 (kernel version ${{ github.event.inputs.KERNEL_VERSION }})"
+            fi
+          done
+
+      - name: 下载并应用SCX补丁
+        if: ${{ github.event.inputs.SCX == 'true' }}
+        run: |
+          cd kernel_workspace/kernel_platform/
+          git clone https://github.com/HanKuCha/sched_ext.git
+          cp -r ./sched_ext/* ./common/kernel/sched
+          rm -rf ./sched_ext/.git
+          cd common/kernel/sched
+
+          # 保证Kconfig存在（若无则新建）
+          [ -f Kconfig ] || touch Kconfig
+          if ! grep -q SCHED_CLASS_EXT Kconfig; then
+            echo "config SCHED_CLASS_EXT" >> Kconfig
+            echo "    bool \"Enable SchedExt (HanKuCha SCX)\"" >> Kconfig
+            echo "    default n" >> Kconfig
+            echo "    help" >> Kconfig
+            echo "      Enable the external SCX scheduler for advanced tuning." >> Kconfig
+          fi
+
+          # 保证 Makefile 追加
+          grep -q hmbird_sched_proc_main.o Makefile || \
+            echo 'obj-$(CONFIG_SCHED_CLASS_EXT) += hmbird_sched_proc_main.o slim_sysctl.o' >> Makefile
+
+          # 保证 defconfig 追加
+          DEFCONFIG=../../arch/arm64/configs/gki_defconfig
+          grep -q CONFIG_SCHED_CLASS_EXT "$DEFCONFIG" || echo 'CONFIG_SCHED_CLASS_EXT=y' >> "$DEFCONFIG"
+
+      - name: "[DEBUG] SCX目录结构和主要文件内容"
+        if: ${{ github.event.inputs.SCX == 'true' }}
+        run: |
+          echo "==== [DEBUG] kernel_workspace/kernel_platform/common/kernel/sched 目录结构 ===="
+          ls -l kernel_workspace/kernel_platform/common/kernel/sched || true
+          echo "==== [DEBUG] Kconfig内容 ===="
+          cat kernel_workspace/kernel_platform/common/kernel/sched/Kconfig || echo "无Kconfig"
+          echo "==== [DEBUG] Makefile内容 ===="
+          cat kernel_workspace/kernel_platform/common/kernel/sched/Makefile || echo "无Makefile"
+          echo "==== [DEBUG] defconfig内容 ===="
+          cat kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig || echo "无defconfig"
+
+      - name: 写入SUSFS、ZRAM内核配置
+        run: |
+          cd kernel_workspace/kernel_platform
+          DEFCONFIG=./common/arch/arm64/configs/gki_defconfig
+
+          echo "# SUSFS/KSU基础配置" >> "$DEFCONFIG"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
+
+          if [[ "${{ github.event.inputs.ZRAM }}" == "true" ]]; then
+            echo "# 启用ZRAM及主流压缩算法支持" >> "$DEFCONFIG"
+            echo "CONFIG_ZSMALLOC=y" >> "$DEFCONFIG"
+            echo "CONFIG_CRYPTO_LZ4HC=y" >> "$DEFCONFIG"
+            echo "CONFIG_CRYPTO_LZ4K=y" >> "$DEFCONFIG"
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> "$DEFCONFIG"
+            echo "CONFIG_CRYPTO_842=y" >> "$DEFCONFIG"
+            echo "CONFIG_CRYPTO_LZ4K_OPLUS=y" >> "$DEFCONFIG"
+            echo "CONFIG_ZRAM_WRITEBACK=y" >> "$DEFCONFIG"
+          fi
+
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+
+      - name: 编译前强制注入SCX到最终 .config（仅5.10/5.15，SCX选项打开时，带缩进）
+        if: ${{ (github.event.inputs.KERNEL_VERSION == '5.10' || github.event.inputs.KERNEL_VERSION == '5.15') && github.event.inputs.SCX == 'true' }}
+        shell: bash
+        run: |
+          target_file="kernel_workspace/kernel_platform/build/kernel/build.sh"
+          if [[ ! -f "$target_file" ]]; then
+            echo "❌ 未找到 build.sh: $target_file"
+            exit 1
+          fi
+          if grep -q "SCX patch start" "$target_file"; then
+            echo "已patch: $target_file"
+            exit 0
+          fi
+          sed -i '/echo " Building kernel"/i\# ==== SCX patch start ====' "$target_file"
+          sed -i '/echo " Building kernel"/i\if [ -f "${OUT_DIR}/.config" ]; then' "$target_file"
+          sed -i '/echo " Building kernel"/i\    grep -q "^CONFIG_SCHED_CLASS_EXT=y" "${OUT_DIR}/.config" || echo "CONFIG_SCHED_CLASS_EXT=y" >> "${OUT_DIR}/.config"' "$target_file"
+          sed -i '/echo " Building kernel"/i\    (cd ${OUT_DIR} && make O=${OUT_DIR} olddefconfig)' "$target_file"
+          sed -i '/echo " Building kernel"/i\fi' "$target_file"
+          sed -i '/echo " Building kernel"/i\# ==== SCX patch end ====' "$target_file"
+          echo "✅ 已patch: $target_file"
+
+      - name: "[DEBUG] 编译前关键路径和配置检查"
+        run: |
+          echo "==== [DEBUG] 查找所有 .config 文件 ===="
+          find kernel_workspace -type f -name ".config" | tee all_config_paths.txt
+
+          echo "==== [DEBUG] .config 主要内容 ===="
+          for cfile in $(cat all_config_paths.txt); do
+            echo "---- $cfile ----"
+            tail -n 20 "$cfile"
+            grep CONFIG_SCHED_CLASS_EXT "$cfile" || echo "没有SCHED_CLASS_EXT"
+          done
+
+          echo "==== [DEBUG] out 目录结构（3层） ===="
+          tree -L 3 kernel_workspace/kernel_platform/out || true
+
+          echo "==== [DEBUG] 当前build.sh patch片段 ===="
+          grep -A 10 "SCX patch start" kernel_workspace/kernel_platform/build/kernel/build.sh || true
+
+      - name: 编译内核
+        run: |
+          set -e
+          if [[ "${{ github.event.inputs.KERNEL_VERSION }}" == "6.1" || "${{ github.event.inputs.KERNEL_VERSION }}" == "6.6" ]]; then
+            cd kernel_workspace/kernel_platform/common
+            export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r487747c/bin:/usr/lib/ccache:$PATH"
+            make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang O=out gki_defconfig
+            yes "" | make ARCH=arm64 O=out olddefconfig
+            make -j2 LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang O=out all
+          elif [[ "${{ github.event.inputs.KERNEL_VERSION }}" == "5.10" || "${{ github.event.inputs.KERNEL_VERSION }}" == "5.15" ]]; then
+            cd kernel_workspace/kernel_platform/common
+            export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r383902b/bin:/usr/lib/ccache:$PATH"
+            make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang O=out all KCFLAGS=-Wno-frame-larger-than
+            echo "CONFIG_SCHED_CLASS_EXT=y" >> out/.config
+            yes "" | make ARCH=arm64 O=out olddefconfig
+            make -j2 LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang O=out all
+          else
+            cd kernel_workspace
+            LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ github.event.inputs.CPUD }} gki
+          fi
+
+      - name: "[DEBUG] 编译后查找 .config、SCX对象等"
+        run: |
+          echo "==== [DEBUG] 查找所有 .config 文件 ===="
+          find kernel_workspace -type f -name ".config" | tee all_config_paths.txt
+
+          echo "==== [DEBUG] .config 主要内容 ===="
+          for cfile in $(cat all_config_paths.txt); do
+            echo "---- $cfile ----"
+            tail -n 20 "$cfile"
+            grep CONFIG_SCHED_CLASS_EXT "$cfile" || echo "没有SCHED_CLASS_EXT"
+          done
+
+          echo "==== [DEBUG] out 目录结构（3层） ===="
+          tree -L 3 kernel_workspace/kernel_platform/out || true
+
+          echo "==== [DEBUG] SCX对象文件 ===="
+          find kernel_workspace/kernel_platform/out -name "hmbird_sched_proc_main.o" || echo "无hmbird_sched_proc_main.o"
+          find kernel_workspace/kernel_platform/out -name "slim_sysctl.o" || echo "无slim_sysctl.o"
+
+      - name: "[DEBUG] 自动查找Image路径等"
+        id: image_path
+        run: |
+          IMAGE=$(find kernel_workspace/kernel_platform/out -type f -name "Image" | head -n 1)
+          if [[ -z "$IMAGE" ]]; then
+            echo "未找到 Image 文件，构建可能失败"
+            exit 1
+          fi
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
+          CONFIG=$(find "$(dirname "$IMAGE")" -maxdepth 2 -name ".config" | head -n 1)
+          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
+          echo "CONFIG=$CONFIG" >> $GITHUB_OUTPUT
+          OUTROOT=$(echo "$IMAGE" | sed 's|/gki_kernel/.*||')
+          echo "OUTROOT=$OUTROOT" >> $GITHUB_ENV
+          echo "OUTROOT=$OUTROOT" >> $GITHUB_OUTPUT
+
+      - name: "[DEBUG] 编译后检查SCX对象文件与符号"
+        if: ${{ github.event.inputs.SCX == 'true' }}
+        run: |
+          echo "==== [DEBUG] 查找hmbird_sched_proc_main.o ===="
+          find "${{ env.OUTROOT }}" -name "hmbird_sched_proc_main.o" || echo "无hmbird_sched_proc_main.o"
+          echo "==== [DEBUG] 查找slim_sysctl.o ===="
+          find "${{ env.OUTROOT }}" -name "slim_sysctl.o" || echo "无slim_sysctl.o"
+          echo "==== [DEBUG] 查找Image文件 ===="
+          echo "${{ env.IMAGE }}"
+
+      - name: "[DEBUG] 编译后.config检查SCX配置"
+        if: ${{ github.event.inputs.SCX == 'true' }}
+        run: |
+          echo "==== [DEBUG] 编译后 .config 检查SCX配置 ===="
+          grep CONFIG_SCHED_CLASS_EXT "${{ env.CONFIG }}" || echo "无CONFIG_SCHED_CLASS_EXT"
+
+      - name: "[DEBUG] Image文件中查找SCX符号（strings）"
+        if: ${{ github.event.inputs.SCX == 'true' }}
+        run: |
+          if [[ -f "${{ env.IMAGE }}" ]]; then
+            echo "==== [DEBUG] Image中查找hmbird_sched相关符号 ===="
+            strings "${{ env.IMAGE }}" | grep -i hmbird_sched || echo "Image中无hmbird_sched相关字符串"
+            strings "${{ env.IMAGE }}" | grep -i slim_sysctl || echo "Image中无slim_sysctl相关字符串"
+          else
+            echo "未找到Image文件"
+          fi
+
+      - name: 制作AnyKernel3内核刷机包
+        run: |
+          git clone https://github.com/Kernel-SU/AnyKernel3 AnyKernel3-no_kpm --depth=1
+          git clone https://github.com/Kernel-SU/AnyKernel3 AnyKernel3-kpm --depth=1
+          rm -rf AnyKernel3-{kpm,no_kpm}/.git
+          rm -f AnyKernel3-{kpm,no_kpm}/push.sh
+
+          if [[ -n "${IMAGE}" && -f "${IMAGE}" ]]; then
+            cp "${IMAGE}" AnyKernel3-no_kpm/Image
+            echo "IMAGE_PATH=${IMAGE}" >> $GITHUB_ENV
+          else
+            echo "未找到 Image 文件，构建可能失败"
+            exit 1
+          fi
+
+      - name: 上传AnyKernel3 (No_KPM)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3_SukiSU_Ultra_${{ env.KSUVER }}_${{ github.event.inputs.FEIL }}_NoKPM
+          path: AnyKernel3-no_kpm/*
+
+      - name: 应用KPM补丁并制作KPM刷机包
+        run: |
+          echo "使用的 Image 路径是: $IMAGE_PATH"
+          cd "$(dirname "$IMAGE_PATH")"
+          cp Image $GITHUB_WORKSPACE/AnyKernel3-no_kpm/Image
+          curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          rm -f Image
+          mv oImage Image
+          cp Image $GITHUB_WORKSPACE/AnyKernel3-kpm/Image
+          cp Image $GITHUB_WORKSPACE/kernel_workspace/kernel
+
+      - name: 上传AnyKernel3 (KPM)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3_SukiSU_Ultra_${{ env.KSUVER }}_${{ github.event.inputs.FEIL }}_KPM
+          path: AnyKernel3-kpm/*
+
+      - name: 下载并解压zram内核模块
+        if: ${{ github.event.inputs.ZRAM == 'true' }}
+        run: |
+          sudo apt install -y unzip
+          curl -s https://api.github.com/repos/FurLC/ZRAM-Module/releases/latest | \
+            grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | xargs wget -N
+          unzip "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
+
+      - name: 上传ZRAM-Module
+        if: ${{ github.event.inputs.ZRAM == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZRAM-Module_${{ github.event.inputs.KERNEL_VERSION }}_${{ github.event.inputs.FEIL }}
+          path: ZRAM-Module/*
