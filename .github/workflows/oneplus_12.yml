@@ -30,6 +30,11 @@ on:
        required: false
        default: false
        type: boolean
+      SCX:
+        description: "是否启用SCX调速器"
+        type: boolean
+        required: true
+        default: false
 
 
 jobs:
@@ -189,14 +194,32 @@ jobs:
          sed -i '$s|echo "\$res"|echo "\-${{ github.event.inputs.KERNEL_SUFFIX }}"|' ./common/scripts/setlocalversion
          sed -i '$s|echo "\$res"|echo "\-${{ github.event.inputs.KERNEL_SUFFIX }}"|' ./msm-kernel/scripts/setlocalversion
 
-      - name: Add sched_ext
-        if: ${{inputs.enable_feature_z }}
+      - name: 下载并应用SCX补丁
+        if: ${{ github.event.inputs.SCX == 'true' }}
         run: |
-         cd kernel_workspace/kernel_platform/
-         git clone https://github.com/HanKuCha/sched_ext.git
-         cp -r ./sched_ext/* ./common/kernel/sched
-         rm -rf ./sched_ext/.git
-         cd common/kernel/sched
+          cd kernel_workspace/kernel_platform/
+          git clone https://github.com/HanKuCha/sched_ext.git
+          cp -r ./sched_ext/* ./common/kernel/sched
+          rm -rf ./sched_ext/.git
+          cd common/kernel/sched
+
+          # 保证Kconfig存在（若无则新建）
+          [ -f Kconfig ] || touch Kconfig
+          if ! grep -q SCHED_CLASS_EXT Kconfig; then
+            echo "config SCHED_CLASS_EXT" >> Kconfig
+            echo "    bool \"Enable SchedExt (HanKuCha SCX)\"" >> Kconfig
+            echo "    default n" >> Kconfig
+            echo "    help" >> Kconfig
+            echo "      Enable the external SCX scheduler for advanced tuning." >> Kconfig
+          fi
+
+          # 保证 Makefile 追加
+          grep -q hmbird_sched_proc_main.o Makefile || \
+            echo 'obj-$(CONFIG_SCHED_CLASS_EXT) += hmbird_sched_proc_main.o slim_sysctl.o' >> Makefile
+
+          # 保证 defconfig 追加
+          DEFCONFIG=../../arch/arm64/configs/gki_defconfig
+          grep -q CONFIG_SCHED_CLASS_EXT "$DEFCONFIG" || echo 'CONFIG_SCHED_CLASS_EXT=y' >> "$DEFCONFIG"
 
       - name: Build Kernel
         run: |
