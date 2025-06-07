@@ -109,6 +109,9 @@ jobs:
 
       - name: 安装编译依赖
         run: |
+          sudo apt-get update
+          sudo apt-get install lld
+          sudo apt-get install llvm
           sudo apt update
           sudo apt install -y python3 git curl ccache unzip libelf-dev lld llvm clang llvm-dev
 
@@ -360,7 +363,8 @@ jobs:
           if [[ "${{ github.event.inputs.KERNEL_VERSION }}" == "6.1" || "${{ github.event.inputs.KERNEL_VERSION }}" == "6.6" ]]; then
             cd kernel_workspace/kernel_platform/common
             export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r487747c/bin:/usr/lib/ccache:$PATH"
-            make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang O=out gki_defconfig
+            make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole LD=ld.lld  HOSTLD=ld.lld O=out KCFLAGS+=-O2 gki_defconfig all
+          
             yes "" | make ARCH=arm64 O=out olddefconfig
             make -j2 LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang O=out all
           elif [[ "${{ github.event.inputs.KERNEL_VERSION }}" == "5.10" || "${{ github.event.inputs.KERNEL_VERSION }}" == "5.15" ]]; then
